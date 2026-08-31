@@ -41,6 +41,69 @@ import {
 import { createPage, createShellPage } from './templates';
 import { assertValidLoadPreviousSessionOption, type ChatFrameIdentity } from './types';
 
+const QUERY_PARAM_EXPRESSION =
+	/\{\{\s*\$query(?:\.([a-zA-Z0-9_-]+)|\[['"]?([a-zA-Z0-9_-]+)['"]?\])\s*\}\}/g;
+
+/** Only primitives render as chat text - anything else would show up as "[object Object]". */
+const asDisplayText = (value: unknown): string =>
+	typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+		? String(value)
+		: '';
+
+const formatQueryValue = (value: unknown): string => {
+	// A repeated param (`?a=1&a=2`) arrives as an array; a nested one (`?a[b]=c`) as an object
+	const text = Array.isArray(value)
+		? value.map(asDisplayText).filter(Boolean).join(', ')
+		: asDisplayText(value);
+
+	// NUL delimits the placeholders in resolveChatText, so a value carrying one of its own
+	// would be re-read as a placeholder while they are substituted back in
+	return text.split('\0').join('');
+};
+
+/**
+ * Resolves a hosted-chat text field (title, subtitle, initial messages, ...): real n8n
+ * expressions in it are evaluated as usual, while `{{ $query.x }}` is swapped in from the
+ * request's query string. `$query` isn't part of the expression data proxy, so it's handled
+ * separately here rather than by the evaluator.
+ *
+ * Query values are substituted only *after* evaluation, as plain string replacement — they
+ * come from a public webhook request, so splicing them into the template beforehand would let
+ * a crafted query value (e.g. containing its own `{{ }}`) reopen a new expression block and
+ * have it evaluated.
+ */
+const resolveChatText = (
+	ctx: IWebhookFunctions,
+	rawValue: string | undefined,
+	queryParams: Record<string, unknown>,
+): string => {
+	if (!rawValue) return '';
+
+	const queryValues: string[] = [];
+	// NUL-delimited: not typable in the UI, and formatQueryValue strips it from the values,
+	// so nothing in the resolved text can be mistaken for a placeholder
+	const placeholderFor = (index: number) => `\0${index}\0`;
+
+	const withPlaceholders = rawValue.replace(
+		QUERY_PARAM_EXPRESSION,
+		(_match: string, dotKey?: string, bracketKey?: string) => {
+			const key = dotKey ?? bracketKey;
+			queryValues.push(formatQueryValue(key ? queryParams[key] : undefined));
+			return placeholderFor(queryValues.length - 1);
+		},
+	);
+
+	let resolved = withPlaceholders.startsWith('=')
+		? asDisplayText(ctx.evaluateExpression(withPlaceholders.slice(1)))
+		: withPlaceholders;
+
+	queryValues.forEach((value, index) => {
+		resolved = resolved.split(placeholderFor(index)).join(value);
+	});
+
+	return resolved;
+};
+
 const isPublicChatTriggerDisabled = () => Container.get(ChatTriggerConfig).disablePublicChat;
 const allowFileUploadsOption: INodeProperties = {
 	displayName: 'Allow File Uploads',
@@ -858,12 +921,8 @@ export class ChatTrigger extends Node {
 		validateNodeParameters(
 			options,
 			{
-				getStarted: { type: 'string' },
-				inputPlaceholder: { type: 'string' },
 				loadPreviousSession: { type: 'string' },
 				showWelcomeScreen: { type: 'boolean' },
-				subtitle: { type: 'string' },
-				title: { type: 'string' },
 				allowFileUploads: { type: 'boolean' },
 				allowedFilesMimeTypes: { type: 'string' },
 				customCss: { type: 'string' },
@@ -881,6 +940,7 @@ export class ChatTrigger extends Node {
 			: options.responseMode === 'streaming';
 
 		const req = ctx.getRequestObject();
+		const queryParams: Record<string, unknown> = req.query ?? {};
 		const webhookName = ctx.getWebhookName();
 		const bodyData = ctx.getBodyData() ?? {};
 
@@ -918,15 +978,28 @@ export class ChatTrigger extends Node {
 					| 'none'
 					| 'basicAuth'
 					| 'n8nUserAuth';
-				const initialMessagesRaw = ctx.getNodeParameter('initialMessages', '');
+				// Fetched raw (unresolved) so `{{ $query.x }}` survives to resolveChatText below -
+				// the normal resolver would already have wiped it out, since `$query` isn't part
+				// of the expression data proxy.
+				const initialMessagesRaw = ctx.getNodeParameter('initialMessages', '', {
+					rawExpressions: true,
+				});
 				assertParamIsString('initialMessage', initialMessagesRaw, ctx.getNode());
 				const instanceId = ctx.getInstanceId();
+				const initialMessages = resolveChatText(ctx, initialMessagesRaw, queryParams);
 
 				const i18nConfig: Record<string, string> = {};
 				const keys = ['getStarted', 'inputPlaceholder', 'subtitle', 'title'] as const;
 				for (const key of keys) {
-					if (options[key] !== undefined) {
-						i18nConfig[key] = options[key];
+					// Fetched raw per-field (dotted path into the `options` collection) for the same
+					// reason as initialMessagesRaw above - only these four fields need `$query`
+					// interpolation, so the rest of `options` stays resolved as usual.
+					const rawText = ctx.getNodeParameter(`options.${key}`, undefined, {
+						rawExpressions: true,
+					});
+					if (rawText !== undefined) {
+						assertParamIsString(key, rawText, ctx.getNode());
+						i18nConfig[key] = resolveChatText(ctx, rawText, queryParams);
 					}
 				}
 
@@ -982,7 +1055,7 @@ export class ChatTrigger extends Node {
 					},
 					showWelcomeScreen: options.showWelcomeScreen,
 					loadPreviousSession,
-					initialMessages: initialMessagesRaw,
+					initialMessages,
 					webhookUrl,
 					mode,
 					instanceId,

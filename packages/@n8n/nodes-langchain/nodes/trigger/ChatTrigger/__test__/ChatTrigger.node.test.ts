@@ -426,7 +426,11 @@ describe('ChatTrigger Node', () => {
 			lastName: 'Sitor',
 		};
 
-		const renderSetupPage = async (authentication = 'n8nUserAuth') => {
+		const renderSetupPage = async (
+			authentication = 'n8nUserAuth',
+			options: Record<string, unknown> = {},
+			initialMessages = '',
+		) => {
 			mockContext.getNodeParameter.mockImplementation(
 				(
 					paramName: string,
@@ -434,10 +438,17 @@ describe('ChatTrigger Node', () => {
 				): boolean | string | object | undefined => {
 					if (paramName === 'public') return true;
 					if (paramName === 'mode') return 'hostedChat';
-					if (paramName === 'options') return {};
+					if (paramName === 'options') return options;
+					if (paramName.startsWith('options.')) {
+						return options[paramName.slice('options.'.length)] as
+							| boolean
+							| string
+							| object
+							| undefined;
+					}
 					if (paramName === 'availableInChat') return false;
 					if (paramName === 'authentication') return authentication;
-					if (paramName === 'initialMessages') return '';
+					if (paramName === 'initialMessages') return initialMessages;
 					return defaultValue;
 				},
 			);
@@ -501,6 +512,46 @@ describe('ChatTrigger Node', () => {
 			);
 			// No author-supplied CSS or markup on the trusted document.
 			expect(renderedPage()).not.toContain('createChat');
+		});
+
+		it('interpolates hosted chat strings from the request query string', async () => {
+			mockRequest.query = {
+				title: 'Client 42',
+				subtitle: 'Support session',
+			};
+			mockContext.getNodeParameter.mockImplementation(
+				(
+					paramName: string,
+					defaultValue?: boolean | string | object,
+				): boolean | string | object | undefined => {
+					if (paramName === 'public') return true;
+					if (paramName === 'mode') return 'hostedChat';
+					if (paramName === 'options')
+						return {
+							title: 'Chat {{ $query.title }}',
+							subtitle: '{{ $query.subtitle }}',
+						};
+					if (paramName === 'availableInChat') return false;
+					if (paramName === 'authentication') return 'none';
+					if (paramName === 'initialMessages')
+						return 'Hello {{ $query.title }}\n{{ $query.subtitle }}';
+					return defaultValue;
+				},
+			);
+
+			await renderSetupPage(
+				'none',
+				{
+					title: 'Chat {{ $query.title }}',
+					subtitle: '{{ $query.subtitle }}',
+				},
+				'Hello {{ $query.title }}\n{{ $query.subtitle }}',
+			);
+
+			expect(renderedPage()).toContain('Chat Client 42');
+			expect(renderedPage()).toContain('Support session');
+			expect(renderedPage()).toContain('Hello Client 42');
+			expect(renderedPage()).toContain('Support session');
 		});
 
 		it('renders the author chat for the frame own request', async () => {
@@ -617,6 +668,35 @@ describe('ChatTrigger Node', () => {
 			await renderSetupPage();
 
 			expect(renderedPage()).toContain('data-src="/webhook-test/abc/chat?n8nShellInner=1"');
+		});
+
+		it('interpolates query parameters with simple query string (user reported issue)', async () => {
+			// Simulate user's exact scenario
+			mockRequest.query = {
+				test: 'Hallo Welt',
+			};
+			mockContext.getWebhookName.mockReturnValue('setup');
+			mockContext.getMode.mockReturnValue('webhook');
+			mockContext.getNodeParameter.mockImplementation(
+				(
+					paramName: string,
+					defaultValue?: boolean | string | object,
+				): boolean | string | object | undefined => {
+					if (paramName === 'public') return true;
+					if (paramName === 'mode') return 'hostedChat';
+					if (paramName === 'options')
+						return {
+							title: 'Hi there! 👋 {{ $query.test }}',
+						};
+					if (paramName === 'availableInChat') return false;
+					if (paramName === 'authentication') return 'none';
+					return defaultValue;
+				},
+			);
+
+			await renderSetupPage('none', { title: 'Hi there! 👋 {{ $query.test }}' });
+
+			expect(renderedPage()).toContain('Hi there! 👋 Hallo Welt');
 		});
 	});
 });
